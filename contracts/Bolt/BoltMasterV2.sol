@@ -1,193 +1,223 @@
-/**
- *Submitted for verification at BscScan.com on 2020-09-22
-*/
+// SPDX-License-Identifier: MIT
+pragma solidity 0.7.3;
 
-pragma solidity 0.6.12;
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "./IStrategy.sol";
+import "./IBoltMaster.sol";
 
-
-//LICENCING
-contract BoltMasterV2 is ReentrancyGuard, Pausable, IBoltMaster {
+contract BoltMaster is Ownable, ReentrancyGuard, IBoltMaster {
     using SafeMath for uint256;
-    using SafeBEP20 for IBEP20;
+    using SafeERC20 for IERC20;
 
     // Info of each user.
     struct UserInfo {
-        uint256 wantDepositAmount;     // How many tokens the user has provided.
-        address addr;
+        uint256 amount; // How many amount tokens the user has provided.
+        uint256 rewardDebt; // Reward debt. See explanation below.
     }
 
-    // Info of each pool.
     struct PoolInfo {
-        IBEP20 wantToken;           // Address of oken contract.
-        uint256 wantTotalDeposit;
-        address strategy;
+        address want; // Address of the want token.
+        uint256 accumulatedYieldPerShare; // Accumulated per share, times 1e12. See below.
+        address strat; // Strategy address that will compound want tokens
     }
 
-    uint256 public feeNumerator = 200;
-    uint256 public feeDenominator = 1000;
-    uint256 public maxFeeNumerator = 500;
-    address public feeTo = 0x0000dead;
+    // BTD Address
+    address public yieldToken;
 
-    PoolInfo[] public poolInfo; // Info of each pool.
-    mapping (uint256 => mapping (address => UserInfo)) public userInfo; //poolid -> addr ->  userrinfo
-    mapping (uint256 => UserInfo[]) public poolUsers;//pool id -> users. improve gas pls, used to reflect rewards
+    // Cake Address
+    address public depositToken;
+    // Dev address.
+    address public devaddr;
 
-    event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
-    event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
-    event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount);
+    // Yield that came from strategy, yet to run through updatepool
+    uint256 private unDistributedYield;
 
-    constructor( address _firstStrategy ) public {
-        addStrategy( {_wantToken: 0x000000000dead, _strategy: _firstStrategy } );
+    address private burnAddress = 0x0000000000000000000000000000000000000000;
+
+    PoolInfo public poolInfo;
+    mapping(address => UserInfo) public userInfo; // Info of each user that stakes LP tokens.
+
+    event Deposit(address indexed user, uint256 amount);
+    event Withdraw(address indexed user, uint256 amount);
+    event EmergencyWithdraw(
+        address indexed user,
+        uint256 amount
+    );
+
+    constructor(address _depositToken, address _yieldToken) {
+        yieldToken = _yieldToken;
+        depositToken = _depositToken;
+        unDistributedYield = 0;
+
+        poolInfo = PoolInfo({
+            want: _depositToken,
+            accumulatedYieldPerShare: 0,
+            strat: burnAddress
+        });
     }
 
-    function poolLength() external view returns (uint256) {
-        return poolInfo.length;
+    function _pendingYield(address _user) 
+        private
+        view
+        returns (uint256)
+    {
+        UserInfo storage user = userInfo[_user];
+        return poolInfo.accumulatedYieldPerShare.mul(user.amount).sub(user.rewardDebt);
     }
 
-    // Add a new lp to the pool. Can only be called by the owner.
-    // XXX DO NOT add the same LP token more than once. Rewards will be messed up if you do.
-    function addStrategy(IBEP20 _wantToken, address _strategy) public onlyOwner {
-        poolInfo.push(PoolInfo({
-            wantToken: _wantToken,
-            wantTotalDeposit: 0,
-            strategy: _strategy
-        }));
+    // View function to see pending on frontend.
+    function pendingYield(address _user)
+        external        
+        view
+        returns (uint256)
+    {
+        UserInfo storage user = userInfo[_user];
+        return poolInfo.accumulatedYieldPerShare.mul(user.amount).sub(user.rewardDebt);
     }
 
-    //DONE
-    function editStrategy(uint256 _pid, address _newStrategy) public onlyOwner {
-        PoolInfo storage pool = poolInfo[_pid];
+    function setPool(address _newStrategy) public onlyOwner {
 
-        IBoltStrategy oldStrat = IBoltStrategy(pool.strategy);
-        IBoltStrategy newStrat = IBoltStrategy(_newStrategy);
+        IStrategy oldStrat = IStrategy(pool.strategy);
+        IStrategy newStrat = IStrategy(_newStrategy);
 
-        require(oldStrat.wantToken == newStrat.wantToken, "!wantToken");
+        require(oldStrat.depositTokenAddress == newStrat.depositTokenAddress, "!wantToken");
+
+        updatePool();
 
         oldStrat.withdraw(pool.wantTotalDeposit);
-        oldStrat.collectYield();
-        distributeYield(_pid);
-        pool.strategy = newStrat;
 
-        IBEP20(newStrat.wantToken).safeIncreaseAllowance(newStrat, pool.wantTotalDeposit );
-        newStrat.deposit(pool.wantTotalDeposit);
+        poolInfo.strategy = newStrat;
+
+        IBEP20(newStrat.wantToken).safeIncreaseAllowance(newStrat, poolInfo.wantTotalDeposit );
+        newStrat.deposit(poolInfo.wantTotalDeposit);
 
     }
 
-    // TODO.
-    function pendingYield(uint256 _pid, address _user) external view returns (uint256) {
-        return 0;
+
+    // Update reward variables of the given pool to be up-to-date.
+    // Because yield from external pools isn't deterministic, we have to update users after the next deposit/witdraw.
+    // Pay attention at test time, this could be exploitable
+    function updatePool() private {
+        IStrategy strat = IStrategy(poolInfo.strat);
+
+        uint256 pendingYield = strat.PendingYieldTotal();
+        uint256 shares = strat.DepositedLockedTotal();
+
+        strat.fetchYield();
+
+        if (shares > 0) {
+            poolInfo.accumulatedYieldPerShare = poolInfo.accumulatedYieldPerShare.add(
+                pendingYield.div(shares)
+            );
+        }
     }
 
-    //TODO take taxes
-    function distributeYield(uint256 _pid) private {
-        PoolInfo memory pool = poolInfo[_pid];
-        IBoltStrategy strategy = IBoltStrategy(pool.strategy);
-        if (strategy.pendingYield() > 0) {
-            uint256 harvested = strategy.harvestYield(); //strategy sells eg cake for btd and sends to master (this)
-            uint256 fee = harvested.mul(feeNumerator).div(feeDenominator);
-            
-            harvested = harvested.sub(fee);
+    function deposit(uint256 _wantAmt) public nonReentrant {
+        updatePool();
+        UserInfo storage user = userInfo[msg.sender];
 
-            IBEP20(pool.yieldToken).safeTransfer(feeTo, fee);
+        if (user.amount > 0) {
+            // Send them what we owe them.
+            uint256 pending = _pendingYield(msg.sender);
+            IERC20(yieldToken).safeTransfer(
+                address(msg.sender),
+                pending
+            );
+        }
+        if (_wantAmt > 0) {
+            // Get from user
+            IERC20(poolInfo.want).safeTransferFrom(
+                address(msg.sender),
+                address(this),
+                _wantAmt
+            );
 
-            UserInfo[] memory users = poolUsers[_pid];
-            for (uint256 i = 0; i < users.length; i++) {
-                UserInfo memory user = users[i];
-                if ( user.wantDepositAmount > 0 ) {
-                    uint256 userYield = user.wantDepositAmount.mul(harvested).div(pool.wantTotalDeposit);
-                    IBEP20(pool.yieldToken).safeTransfer(user.addr, userYield);
-                }
+            // Track user deposit
+            user.amount = user.amount.add(amountDeposit);
+
+            // Send deposit to strategy.
+            IERC20(poolInfo.want).safeIncreaseAllowance(poolInfo.strat, _wantAmt);
+            uint256 amountDeposit = IStrategy(poolInfo.strat).deposit(_wantAmt);
+
+        }
+
+        user.rewardDebt = user.amount.mul(poolInfo.accumulatedYieldPerShare).div(1e12);
+        emit Deposit(msg.sender, _wantAmt);
+    }
+
+    // Withdraw LP tokens from BoltMaster.
+    function withdraw(uint256 _wantAmt) public nonReentrant {
+        updatePool();
+        PoolInfo storage pool = poolInfo;
+        UserInfo storage user = userInfo[msg.sender];
+        uint256 total = IStrategy(pool.strat).DepositedLockedTotal();
+        require(user.amount > 0, "user.amount is 0");
+        require(total > 0, "Total is 0");
+        // // Withdraw pending yield
+        uint256 pending =
+            user.amount.mul(pool.accumulatedYieldPerShare).div(1e12).sub(
+                user.rewardDebt
+            );
+        if (pending > 0) {
+            safeTransfer(msg.sender, pending);
+        }
+        // // Withdraw want tokens
+         uint256 amount = user.amount;
+        if (_wantAmt > amount) {
+            _wantAmt = amount;
+        }
+        if (_wantAmt > 0) {
+            uint256 amountRemove =
+                IStrategy(pool.strat).withdraw(_wantAmt);
+            if (amountRemove > user.amount) {
+                user.amount = 0;
+            } else {
+                user.amount = user.amount.sub(amountRemove);
             }
-        }
-    }
-
-    function increaseDeposit(uint256 _pid, uint256 _amount) private {
-        if (_amount > 0) {
-            PoolInfo storage pool = poolInfo[_pid];
-            UserInfo storage userViaAddress = userInfo[_pid][msg.sender];
-
-            userViaAddress.wantDepositAmount.add(_amount);
-            pool.wantTotalDeposit.add(_amount);
-            
-            {
-                bool poolUserUpdated = false;
-                for (uint256 i = 0; i < poolUsers.length; i++) {
-                    UserInfo storage userViaPool = poolUsers[i];
-                    if (userViaPool.addr == msg.sender) {
-                        userViaPool.wantDepositAmount.add(_amount);
-                        poolUserUpdated = true;
-                    }           
-                }
-
-                if (!poolUserUpdated) {
-                    poolUsers.push(
-                        UserInfo({
-                            wantDepositAmount: _amount,
-                            addr: msg.sender
-                        })
-                    );
-                }
-            } 
-
-            IBEP20(pool.wantToken).safeTransferFrom(msg.sender, this, _amount);
-            IBEP20(pool.wantToken).safeIncreaseAllowance(pool.strategy, _amount);
-            IBoltStrategy(pool.strategy).deposit(_amount);
-        }
-    }
-
-    function decreaseDeposit(uint256 _pid, uint256 _amount) private {
-        if (_amount > 0) {
-            PoolInfo storage pool = poolInfo[_pid];
-            UserInfo storage userViaAddress = userInfo[_pid][msg.sender];
-
-            require (userViaAddress.wantDepositAmount >= _amount, "cant withdraw what you don't have");
-
-            userViaAddress.wantDepositAmount.sub(_amount);
-            pool.wantTotalDeposit.sub(_amount);
-        
-            bool poolUserUpdated = false;
-
-            for (uint256 i = 0; i < poolUsers.length; i++) {
-                UserInfo storage userViaPool = poolUsers[i];
-                if (userViaPool.addr == msg.sender) {
-                    require (userViaPool.wantDepositAmount >= _amount, "cant withdraw what you don't have");
-                    userViaPool.wantDepositAmount.sub(_amount);
-                    poolUserUpdated = true;
-                }           
+            uint256 wantBal = IERC20(pool.want).balanceOf(address(this));
+            if (wantBal < _wantAmt) {
+                _wantAmt = wantBal;
             }
-
-            require (poolUserUpdated, "cant withdraw what you don't have");
-
-            IBoltStrategy(pool.strategy).withdraw(_amount);
-            IBEP20(pool.wantToken).safeTransfer(msg.sender, _amount);      
+            IERC20(pool.want).safeTransfer(address(msg.sender), _wantAmt);
         }
+        user.rewardDebt = user.amount.mul(pool.accumulatedYieldPerShare).div(1e12);
+        emit Withdraw(msg.sender, _wantAmt);
     }
 
-    // Deposit LP tokens to MasterChef for CAKE allocation.
-    function deposit(uint256 _pid, uint256 _amount) public whenNotPaused {
-        distributeYield(_pid);
-        increaseDeposit(_pid, _amount);
-        emit Deposit(msg.sender, _pid, _amount);
-    }
-
-    // Withdraw LP tokens from MasterChef.
-    function withdraw(uint256 _pid, uint256 _amount) public whenNotPaused {
-        distributeYield(_pid);
-        decreaseDeposit(_pid, _amount);
-        emit Withdraw(msg.sender, _pid, _amount);
-    }
-
-    function setFeeParams(uint256 _newFee, address _newFeeTo) public onlyOwner {
-        require(_newFee <= maxFeeNumerator);
-        feeNumerator = _newFee;
-        feeTo = _newFeeTo;
+    // Safe transfer function, just in case if rounding error causes pool to not have enough
+    function safeTransfer(address _to, uint256 yieldAmount) internal {
+        uint256 thisYieldBalance = IERC20(yieldToken).balanceOf(address(this));
+        if (yieldAmount > thisYieldBalance) {
+            IERC20(yieldToken).transfer(_to, thisYieldBalance);
+        } else {
+            IERC20(yieldToken).transfer(_to, yieldAmount);
+        }
     }
 
     // Withdraw without caring about rewards. EMERGENCY ONLY.
-    function emergencyWithdraw(uint256 _pid) public {
-        uint256 amt = userInfo[_pid][msg.sender].wantDepositAmount;
-        decreaseDeposit(_pid, amt);
-        emit EmergencyWithdraw(msg.sender, _pid, amt);
+    function emergencyWithdraw() public nonReentrant {
+        PoolInfo storage pool = poolInfo;
+        UserInfo storage user = userInfo[msg.sender];
+
+        uint256 amount = user.amount;
+
+        IStrategy(pool.strat).withdraw(amount);
+
+        user.amount = 0;
+        user.rewardDebt = 0;
+        IERC20(pool.want).safeTransfer(address(msg.sender), amount);
+        emit EmergencyWithdraw(msg.sender, amount);
     }
 
+    function inCaseTokensGetStuck(address _token, uint256 _amount)
+        public
+        onlyOwner
+    {
+        require(_token != depositToken, "!safe");
+        IERC20(_token).safeTransfer(msg.sender, _amount);
+    }
 }
