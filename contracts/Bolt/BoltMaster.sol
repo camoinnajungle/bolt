@@ -200,7 +200,7 @@ contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
         user.amount = 0;
         user.rewardDebt = 0;
         IERC20(pool.want).safeTransfer(address(msg.sender), withdrawn);
-        emit EmergencyWithdraw(msg.sender, amount);
+        emit EmergencyWithdraw(msg.sender, withdrawn);
     }
 
 }
