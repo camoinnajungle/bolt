@@ -41,6 +41,11 @@ module.exports = {
           accounts,
           url: "https://bsc-dataseed.binance.org/"
         },
+        bsc_test: {
+          chainId: 56,
+          accounts,
+          url: "https://bsc-dataseed.binance.org/"
+        },
         opera: {
           chainId: 250,
           accounts,

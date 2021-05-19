@@ -8,7 +8,7 @@ import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
-import "./IStrategy.sol";
+import "./IBoltStrategy.sol";
 import "./IBoltMaster.sol";
 
 contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
@@ -28,11 +28,6 @@ contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
     }
 
     address private burnAddress = 0x0000000000000000000000000000000000000000;
-
-    uint256 public feeNumerator = 200;
-    uint256 public feeDenominator = 1000;
-    uint256 public maxFeeNumerator = 500;    
-    address public feeTo = burnAddress;
 
     address public yieldToken;
 
@@ -58,19 +53,12 @@ contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
     // Because yield from external pools isn't deterministic, we have to update users after the next deposit/witdraw.
     modifier updatePool()
     {
-        IStrategy strat = IStrategy(poolInfo.strat);
+        IBoltStrategy strat = IBoltStrategy(poolInfo.strat);
         uint256 totalShares = strat.DepositedLockedTotal();
 
         if (totalShares > 0) {
-
             strat.fetchYield();
             uint256 totalYielded = IERC20(poolInfo.want).balanceOf(address(this));
-            
-            if (feeNumerator > 0) {
-                uint256 fee = totalYielded.mul(feeNumerator).div(feeDenominator);
-                totalYielded = totalYielded.sub(fee);
-                safeYieldTransfer(feeTo, fee);
-            }
 
             poolInfo.accumulatedYieldPerShare = poolInfo.accumulatedYieldPerShare.add(
                 totalYielded.mul(1e12).div(totalShares)
@@ -87,8 +75,8 @@ contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
 
     function swapPool(address _newStrategy) public onlyOwner
     {
-        IStrategy oldStrat = IStrategy(poolInfo.strat);
-        IStrategy newStrat = IStrategy(_newStrategy);
+        IBoltStrategy oldStrat = IBoltStrategy(poolInfo.strat);
+        IBoltStrategy newStrat = IBoltStrategy(_newStrategy);
 
         require(oldStrat.depositTokenAddress() == newStrat.depositTokenAddress(), "!wantToken");
 
@@ -103,12 +91,12 @@ contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
     function pullStratDeposit() private updatePool
     {
         uint256 stratBal = IERC20(poolInfo.want).balanceOf(poolInfo.strat);
-        IStrategy(poolInfo.strat).withdraw(stratBal);
+        IBoltStrategy(poolInfo.strat).withdraw(stratBal);
     } 
 
     function depositAll() private
     {
-        IStrategy strat = IStrategy(poolInfo.strat);
+        IBoltStrategy strat = IBoltStrategy(poolInfo.strat);
         uint256 balance = IERC20(poolInfo.want).balanceOf(address(this));
         strat.deposit(balance);
     }
@@ -132,7 +120,7 @@ contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
             // Track user deposit
             user.amount = user.amount.add(_wantAmt);
             // Send deposit to strategy.
-            amountDeposited = IStrategy(poolInfo.strat).deposit(_wantAmt);
+            amountDeposited = IBoltStrategy(poolInfo.strat).deposit(_wantAmt);
         }
 
         user.rewardDebt = user.amount.mul(poolInfo.accumulatedYieldPerShare).div(1e12);
@@ -145,7 +133,7 @@ contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
     {
         PoolInfo storage pool = poolInfo; 
         UserInfo storage user = userInfo[msg.sender];
-        uint256 total = IStrategy(pool.strat).DepositedLockedTotal();
+        uint256 total = IBoltStrategy(pool.strat).DepositedLockedTotal();
         require(user.amount > 0, "user.amount is 0");
         require(total > 0, "Total is 0");
         // Withdraw pending yield
@@ -158,7 +146,7 @@ contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
         _wantAmt = Math.min(_wantAmt, user.amount);
         uint256 amountRemoved = 0;
         if (_wantAmt > 0) {
-            amountRemoved = IStrategy(pool.strat).withdraw(_wantAmt);
+            amountRemoved = IBoltStrategy(pool.strat).withdraw(_wantAmt);
             if (amountRemoved > user.amount) {
                 user.amount = 0;
             } else {
@@ -180,13 +168,6 @@ contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
         IERC20(yieldToken).safeTransfer(_to, toTransfer);
     }
 
-    function setFeeParams(uint256 _newFee, address _newFeeTo) public onlyOwner
-    {
-        require(_newFee <= maxFeeNumerator);
-        feeNumerator = _newFee;
-        feeTo = _newFeeTo;
-    }
-
     // Withdraw without caring about rewards. EMERGENCY ONLY.
     function emergencyWithdraw() public nonReentrant
     {
@@ -195,7 +176,7 @@ contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
 
         uint256 amount = user.amount;
 
-        uint256 withdrawn = IStrategy(pool.strat).withdraw(amount);
+        uint256 withdrawn = IBoltStrategy(pool.strat).withdraw(amount);
 
         user.amount = 0;
         user.rewardDebt = 0;

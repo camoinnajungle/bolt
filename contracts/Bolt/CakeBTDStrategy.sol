@@ -10,10 +10,10 @@ import "@openzeppelin/contracts/math/SafeMath.sol";
 import "./IPancakeswapFarm.sol";
 import "./IPancakeRouter02.sol";
 import "./ISmartChef.sol";
-import "./IStrategy.sol";
+import "./IBoltStrategy.sol";
 import "./IBoltMaster.sol";
 
-contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
+contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IBoltStrategy {
     // Maximises yields in pancakeswap
 
     using SafeMath for uint256;
@@ -49,8 +49,8 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
         address _BoltMasterAddress,
         address _farmContractAddress, // Pancake Farm address
         address _depositTokenAddress, // token we're using to farm
-        address _earnedTokenAddress,  // token that we get back from farm.
-        address _yieldTokenAddress,   // token that we sell earned to.
+        address _earnedTokenAddress, // token that we get back from farm.
+        address _yieldTokenAddress, // token that we sell earned to.
         address _busdTokenAddress,
         address _uniRouterAddress,
         address _treasuryAddress,
@@ -70,14 +70,22 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
         devFees = 0;
         treasuryFees = 0;
 
+        // TODO check this based on earned and yield
         earnedToYieldPath = [
-            earnedTokenAddress,
-            busdTokenAddress,
-            yieldTokenAddress
+        earnedTokenAddress,
+        busdTokenAddress,
+        yieldTokenAddress
         ];
 
-        // Off for testing
-         transferOwnership(BoltMasterAddress);
+        // TODO on this - Off for testing
+        transferOwnership(BoltMasterAddress);
+
+
+        // infinite approve friendly needed contracts
+        IERC20(depositTokenAddress).approve(uniRouterAddress, uint(~0));
+        IERC20(yieldTokenAddress).approve(BoltMasterAddress, uint(~0));
+        IERC20(depositTokenAddress).approve(farmContractAddress, uint(~0));
+
     }
 
     function DepositedLockedTotal() external override view returns (uint256)
@@ -87,9 +95,9 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
 
     function PendingYieldTotal() external override view returns (uint256)
     {
-        uint256 pendingEarnedTokens = ISmartChef(farmContractAddress).pendingReward(address (this));
+        uint256 pendingEarnedTokens = ISmartChef(farmContractAddress).pendingReward(address(this));
 
-        if(pendingEarnedTokens > 0) {
+        if (pendingEarnedTokens > 0) {
             uint[] memory amounts = IPancakeRouter02(uniRouterAddress).getAmountsOut(pendingEarnedTokens, earnedToYieldPath);
             return amounts[amounts.length - 1];
         }
@@ -99,11 +107,11 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
 
     // Receives new deposits from user
     function deposit(uint256 _depositAmt)
-        public
-        onlyOwner
-        whenNotPaused
-        override
-        returns (uint256)
+    public
+    onlyOwner
+    whenNotPaused
+    override
+    returns (uint256)
     {
         IERC20(depositTokenAddress).safeTransferFrom(
             address(msg.sender),
@@ -118,14 +126,13 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
     }
 
     function fetchYield()
-            public
-            onlyOwner
-            override
+    public
+    onlyOwner
+    override
     {
         ISmartChef(farmContractAddress).withdraw(0);
         _sellEarnedToYieldToken();
     }
-
 
 
     function _sellEarnedToYieldToken() internal
@@ -134,12 +141,8 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
         uint256 contractEarnedBalance = IERC20(earnedTokenAddress).balanceOf(address(this));
         uint256 contractYieldBalance = IERC20(yieldTokenAddress).balanceOf(address(this));
 
-        if(contractEarnedBalance > 0)
+        if (contractEarnedBalance > 0)
         {
-            IERC20(depositTokenAddress).safeIncreaseAllowance(
-            uniRouterAddress,
-            contractEarnedBalance);
-
             IPancakeRouter02(uniRouterAddress).swapExactTokensForTokensSupportingFeeOnTransferTokens(
                 contractEarnedBalance,
                 0,
@@ -150,33 +153,23 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
 
             uint256 yieldBalance = IERC20(yieldTokenAddress).balanceOf(address(this));
             uint256 yieldAfterFees = distributeFees(yieldBalance);
-            IERC20(yieldTokenAddress).safeIncreaseAllowance(BoltMasterAddress, yieldAfterFees);
-            //IBoltMaster(BoltMasterAddress).AcceptYield(yieldAfterFees);
         }
-        
     }
 
     function _farm(uint256 _depositAmt) internal {
         depositedLockedTotal = depositedLockedTotal.add(_depositAmt);
-        IERC20(depositTokenAddress).safeIncreaseAllowance(
-            farmContractAddress,
-            _depositAmt
-        );
-
-        ISmartChef(farmContractAddress).deposit(_depositAmt); 
+        ISmartChef(farmContractAddress).deposit(_depositAmt);
     }
 
     function withdraw(uint256 _depositAmt)
-        public
-        override
-        onlyOwner
-        nonReentrant
-        returns (uint256)
+    public
+    override
+    onlyOwner
+    nonReentrant
+    returns (uint256)
     {
-        require(_depositAmt > 0, "_depositAmt <= 0");
+        ISmartChef(farmContractAddress).withdraw(_depositAmt);
 
-        ISmartChef(farmContractAddress).withdraw(_depositAmt); 
-        
         _sellEarnedToYieldToken();
 
         uint256 wantAmt = IERC20(depositTokenAddress).balanceOf(address(this));
@@ -198,36 +191,36 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
 
     ///
 
-    function distributeFees(uint256 _earnedAmt) 
-        internal 
-        returns (uint256)
+    function distributeFees(uint256 _earnedAmt)
+    internal
+    returns (uint256)
     {
         uint256 devFee = _earnedAmt.mul(devFees).div(devFeesMax);
         uint256 treasuryFee = _earnedAmt.mul(treasuryFees).div(treasuryFeesMax);
 
-        if(devFee > 0)
+        if (devFee > 0)
         {
-            IERC20(yieldTokenAddress).transfer(devAddress, devFee);    
+            IERC20(yieldTokenAddress).transfer(devAddress, devFee);
         }
 
-        if(treasuryFee > 0)
+        if (treasuryFee > 0)
         {
-            IERC20(yieldTokenAddress).transfer(treasuryAddress, treasuryFee);    
+            IERC20(yieldTokenAddress).transfer(treasuryAddress, treasuryFee);
         }
 
-        return _earnedAmt.sub(devFee).sub(treasuryFee);        
+        return _earnedAmt.sub(devFee).sub(treasuryFee);
     }
 
-    function setDevFees(uint256 _devFees)     
-        external
+    function setDevFees(uint256 _devFees)
+    external
     {
         require(msg.sender == govAddress, "!gov");
 
         devFees = _devFees;
     }
 
-    function setTreasuryFees(uint256 _treasuryFees)     
-        external
+    function setTreasuryFees(uint256 _treasuryFees)
+    external
     {
         require(msg.sender == govAddress, "!gov");
 
@@ -235,18 +228,16 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
     }
 
 
-
-
-    function setDevAddress(address _devAddress)     
-        external
+    function setDevAddress(address _devAddress)
+    external
     {
         require(msg.sender == govAddress, "!gov");
 
         devAddress = _devAddress;
     }
 
-    function setTreasuryAddress(address _treasuryAddress)     
-        external
+    function setTreasuryAddress(address _treasuryAddress)
+    external
     {
         require(msg.sender == govAddress, "!gov");
 
@@ -254,7 +245,7 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
     }
 
     function pause() public
-     {
+    {
         require(msg.sender == govAddress, "Not authorised");
         _pause();
     }
@@ -264,7 +255,7 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
         _unpause();
     }
 
-    function setGov(address _govAddress) public         
+    function setGov(address _govAddress) public
     {
         require(msg.sender == govAddress, "!gov");
         govAddress = _govAddress;
@@ -274,6 +265,5 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
         require(msg.sender == govAddress, "!gov");
         onlyGov = _onlyGov;
     }
-
 
 }

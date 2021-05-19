@@ -2,7 +2,7 @@
 pragma solidity 0.7.3;
 
 // For interacting with our own strategy
-interface IStrategy {
+interface IBoltStrategy {
     // Total want tokens managed by stratfegy
     function DepositedLockedTotal() external view returns (uint256);
 
