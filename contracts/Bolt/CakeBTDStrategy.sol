@@ -34,7 +34,7 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
 
     address public earnedTokenAddress; // Address of token from syrup pool.
     address public yieldTokenAddress; // Address of token to buy and return
-    address public depositTokenAddress;
+    address public override depositTokenAddress;
     address public busdTokenAddress;
 
     address public treasuryAddress;
@@ -77,7 +77,7 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
         ];
 
         // Off for testing
-        // transferOwnership(BoltMasterAddress);
+         transferOwnership(BoltMasterAddress);
     }
 
     function DepositedLockedTotal() external override view returns (uint256)
@@ -85,10 +85,22 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
         return depositedLockedTotal;
     }
 
+    function PendingYieldTotal() external override view returns (uint256)
+    {
+        uint256 pendingEarnedTokens = ISmartChef(farmContractAddress).pendingReward(address (this));
+
+        if(pendingEarnedTokens > 0) {
+            uint[] memory amounts = IPancakeRouter02(uniRouterAddress).getAmountsOut(pendingEarnedTokens, earnedToYieldPath);
+            return amounts[amounts.length - 1];
+        }
+
+        return 0;
+    }
+
     // Receives new deposits from user
     function deposit(uint256 _depositAmt)
         public
-        // onlyowner this is comment out for testing.
+        onlyOwner
         whenNotPaused
         override
         returns (uint256)
@@ -104,6 +116,17 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
 
         return _depositAmt;
     }
+
+    function fetchYield()
+            public
+            onlyOwner
+            override
+    {
+        ISmartChef(farmContractAddress).withdraw(0);
+        _sellEarnedToYieldToken();
+    }
+
+
 
     function _sellEarnedToYieldToken() internal
     {
@@ -128,7 +151,7 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
             uint256 yieldBalance = IERC20(yieldTokenAddress).balanceOf(address(this));
             uint256 yieldAfterFees = distributeFees(yieldBalance);
             IERC20(yieldTokenAddress).safeIncreaseAllowance(BoltMasterAddress, yieldAfterFees);
-            IBoltMaster(BoltMasterAddress).AcceptYield(yieldAfterFees);
+            //IBoltMaster(BoltMasterAddress).AcceptYield(yieldAfterFees);
         }
         
     }
@@ -146,7 +169,7 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
     function withdraw(uint256 _depositAmt)
         public
         override
-        // onlyowner  Owner should be master.  Commented for testing
+        onlyOwner
         nonReentrant
         returns (uint256)
     {
@@ -252,14 +275,5 @@ contract CakeBTDStrategy is Ownable, ReentrancyGuard, Pausable, IStrategy {
         onlyGov = _onlyGov;
     }
 
-    function inCaseTokensGetStuck(
-        address _token,
-        uint256 _amount,
-        address _to
-    ) public override{
-        require(msg.sender == govAddress, "!gov");
-        require(_token != earnedTokenAddress, "!safe");
-        require(_token != depositTokenAddress, "!safe");
-        IERC20(_token).safeTransfer(_to, _amount);
-    }
+
 }

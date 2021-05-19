@@ -4,7 +4,10 @@ pragma solidity 0.7.3;
 // For interacting with our own strategy
 interface IStrategy {
     // Total want tokens managed by stratfegy
-    function DepositedLockedTotal() external view returns (uint256); 
+    function DepositedLockedTotal() external view returns (uint256);
+
+    // Gets the pending yield from the current earned tokens
+    function PendingYieldTotal() external view returns (uint256);
 
     // Transfer want tokens yetiFarm -> strategy
     function deposit(uint256 _wantAmt)
@@ -16,9 +19,8 @@ interface IStrategy {
         external
         returns (uint256);
 
-    function inCaseTokensGetStuck(
-        address _token,
-        uint256 _amount,
-        address _to
-    ) external;
+    // Converts 3rd party earned tokens to yield tokens and sends back to master
+    function fetchYield() external;
+
+    function depositTokenAddress() external returns (address);
 }

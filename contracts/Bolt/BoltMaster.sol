@@ -3,56 +3,49 @@ pragma solidity 0.7.3;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/math/SafeMath.sol";
+import "@openzeppelin/contracts/math/Math.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./IStrategy.sol";
 import "./IBoltMaster.sol";
 
-contract BoltMaster is Ownable, ReentrancyGuard, IBoltMaster {
+contract BoltMaster is Ownable, Pausable, ReentrancyGuard, IBoltMaster {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
     // Info of each user.
     struct UserInfo {
         uint256 amount; // How many amount tokens the user has provided.
-        uint256 rewardDebt; // Reward debt. See explanation below.
+        uint256 rewardDebt; //unentitled rewards
     }
 
     struct PoolInfo {
         address want; // Address of the want token.
         uint256 accumulatedYieldPerShare; // Accumulated per share, times 1e12. See below.
-        address strat; // Strategy address that will compound want tokens
+        address strat; // Strategy address that will farm from want tokens
     }
 
-    // BTD Address
-    address public yieldToken;
-
-    // Cake Address
-    address public depositToken;
-    // Dev address.
-    address public devaddr;
-
-    // Yield that came from strategy, yet to run through updatepool
-    uint256 private unDistributedYield;
-
     address private burnAddress = 0x0000000000000000000000000000000000000000;
+
+    uint256 public feeNumerator = 200;
+    uint256 public feeDenominator = 1000;
+    uint256 public maxFeeNumerator = 500;    
+    address public feeTo = burnAddress;
+
+    address public yieldToken;
 
     PoolInfo public poolInfo;
     mapping(address => UserInfo) public userInfo; // Info of each user that stakes LP tokens.
 
     event Deposit(address indexed user, uint256 amount);
     event Withdraw(address indexed user, uint256 amount);
-    event EmergencyWithdraw(
-        address indexed user,
-        uint256 amount
-    );
+    event EmergencyWithdraw(address indexed user, uint256 amount);
 
-    constructor(address _depositToken, address _yieldToken) {
+    constructor(address _depositToken, address _yieldToken)
+    {
         yieldToken = _yieldToken;
-        depositToken = _depositToken;
-        unDistributedYield = 0;
-
         poolInfo = PoolInfo({
             want: _depositToken,
             accumulatedYieldPerShare: 0,
@@ -60,168 +53,154 @@ contract BoltMaster is Ownable, ReentrancyGuard, IBoltMaster {
         });
     }
 
-    function _pendingYield(address _user) 
-        private
-        view
-        returns (uint256)
-    {
-        UserInfo storage user = userInfo[_user];
-        return poolInfo.accumulatedYieldPerShare.mul(user.amount).sub(user.rewardDebt);
-    }
-
-    // View function to see pending on frontend.
-    function pendingYield(address _user)
-        external        
-        view
-        returns (uint256)
-    {
-        UserInfo storage user = userInfo[_user];
-        return poolInfo.accumulatedYieldPerShare.mul(user.amount).sub(user.rewardDebt);
-    }
-
-    address private LastDepositor;
-    uint256 private LastDepositAmount;
-
-    function setPool(address newStrat) 
-        public
-        onlyOwner   
-     {
-        poolInfo.strat = newStrat;
-    }
-
-    function AcceptYield(uint256 _yieldAmount) override 
-        nonReentrant
-        external 
-    {
-        require(msg.sender == poolInfo.strat, "!strategy"); 
-        unDistributedYield = _yieldAmount;
-        IERC20(yieldToken).transferFrom(poolInfo.strat, address(this), _yieldAmount);
-    }
-
 
     // Update reward variables of the given pool to be up-to-date.
     // Because yield from external pools isn't deterministic, we have to update users after the next deposit/witdraw.
-    // Pay attention at test time, this could be exploitable
-    function updatePool() private {
-        uint256 shares = IStrategy(poolInfo.strat).DepositedLockedTotal();
+    modifier updatePool()
+    {
+        IStrategy strat = IStrategy(poolInfo.strat);
+        uint256 totalShares = strat.DepositedLockedTotal();
 
-        if (shares > 0) {
-            UserInfo storage lastDepositor = userInfo[LastDepositor];
+        if (totalShares > 0) {
 
-
-            if (shares != LastDepositAmount) {
-                // Distribute the yield
-                poolInfo.accumulatedYieldPerShare = poolInfo.accumulatedYieldPerShare.add(
-                    unDistributedYield.div(shares.sub(LastDepositAmount)));
-                lastDepositor.rewardDebt =
-                    lastDepositor.amount.mul(poolInfo.accumulatedYieldPerShare);
+            strat.fetchYield();
+            uint256 totalYielded = IERC20(poolInfo.want).balanceOf(address(this));
+            
+            if (feeNumerator > 0) {
+                uint256 fee = totalYielded.mul(feeNumerator).div(feeDenominator);
+                totalYielded = totalYielded.sub(fee);
+                safeYieldTransfer(feeTo, fee);
             }
-            unDistributedYield = 0;
+
+            poolInfo.accumulatedYieldPerShare = poolInfo.accumulatedYieldPerShare.add(
+                totalYielded.mul(1e12).div(totalShares)
+            );
         }
+        _;
     }
 
-    function deposit(uint256 _wantAmt) public nonReentrant {
-        updatePool();
+    function pendingYield(address _user) public view returns (uint256)
+    {
+        UserInfo memory user = userInfo[_user];
+        return poolInfo.accumulatedYieldPerShare.mul(user.amount).div(1e12).sub(user.rewardDebt);
+    }
+
+    function swapPool(address _newStrategy) public onlyOwner
+    {
+        IStrategy oldStrat = IStrategy(poolInfo.strat);
+        IStrategy newStrat = IStrategy(_newStrategy);
+
+        require(oldStrat.depositTokenAddress() == newStrat.depositTokenAddress(), "!wantToken");
+
+        pullStratDeposit();
+
+        poolInfo.strat = _newStrategy;
+        IERC20(poolInfo.want).safeApprove(_newStrategy, uint256(-1) );
+
+        depositAll();
+    }
+
+    function pullStratDeposit() private updatePool
+    {
+        uint256 stratBal = IERC20(poolInfo.want).balanceOf(poolInfo.strat);
+        IStrategy(poolInfo.strat).withdraw(stratBal);
+    } 
+
+    function depositAll() private
+    {
+        IStrategy strat = IStrategy(poolInfo.strat);
+        uint256 balance = IERC20(poolInfo.want).balanceOf(address(this));
+        strat.deposit(balance);
+    }
+    
+    function deposit(uint256 _wantAmt) public whenNotPaused nonReentrant updatePool
+    {
         UserInfo storage user = userInfo[msg.sender];
 
+        // Send sender what we owe them.
         if (user.amount > 0) {
-            // Send them what we owe them.
-            uint256 pending = _pendingYield(msg.sender);
-            IERC20(yieldToken).safeTransfer(
-                address(msg.sender),
-                pending
-            );
+            uint256 pending = pendingYield(msg.sender);
+            safeYieldTransfer(msg.sender, pending);
         }
+
+        uint256 amountDeposited = 0;
+
+        // Deposit into strat
         if (_wantAmt > 0) {
             // Get from user
-            IERC20(poolInfo.want).safeTransferFrom(
-                address(msg.sender),
-                address(this),
-                _wantAmt
-            );
-
+            IERC20(poolInfo.want).safeTransferFrom(msg.sender, address(this), _wantAmt);
             // Track user deposit
-            user.amount = user.amount.add(amountDeposit);
-
+            user.amount = user.amount.add(_wantAmt);
             // Send deposit to strategy.
-            IERC20(poolInfo.want).safeIncreaseAllowance(poolInfo.strat, _wantAmt);
-            uint256 amountDeposit = IStrategy(poolInfo.strat).deposit(_wantAmt);
-
+            amountDeposited = IStrategy(poolInfo.strat).deposit(_wantAmt);
         }
 
         user.rewardDebt = user.amount.mul(poolInfo.accumulatedYieldPerShare).div(1e12);
-        emit Deposit(msg.sender, _wantAmt);
+
+        emit Deposit(msg.sender, amountDeposited);
     }
 
     // Withdraw LP tokens from BoltMaster.
-    function withdraw(uint256 _wantAmt) public nonReentrant {
-        updatePool();
-        PoolInfo storage pool = poolInfo;
+    function withdraw(uint256 _wantAmt) public whenNotPaused nonReentrant updatePool
+    {
+        PoolInfo storage pool = poolInfo; 
         UserInfo storage user = userInfo[msg.sender];
         uint256 total = IStrategy(pool.strat).DepositedLockedTotal();
         require(user.amount > 0, "user.amount is 0");
         require(total > 0, "Total is 0");
-        // // Withdraw pending yield
-        uint256 pending =
-            user.amount.mul(pool.accumulatedYieldPerShare).div(1e12).sub(
-                user.rewardDebt
-            );
+        // Withdraw pending yield
+        uint256 pending = pendingYield(msg.sender);
         if (pending > 0) {
-            safeTransfer(msg.sender, pending);
+            safeYieldTransfer(msg.sender, pending);
         }
-        // // Withdraw want tokens
-         uint256 amount = user.amount;
-        if (_wantAmt > amount) {
-            _wantAmt = amount;
-        }
+
+        //Withdraw want tokens
+        _wantAmt = Math.min(_wantAmt, user.amount);
+        uint256 amountRemoved = 0;
         if (_wantAmt > 0) {
-            uint256 amountRemove =
-                IStrategy(pool.strat).withdraw(_wantAmt);
-            if (amountRemove > user.amount) {
+            amountRemoved = IStrategy(pool.strat).withdraw(_wantAmt);
+            if (amountRemoved > user.amount) {
                 user.amount = 0;
             } else {
-                user.amount = user.amount.sub(amountRemove);
+                user.amount = user.amount.sub(amountRemoved);
             }
             uint256 wantBal = IERC20(pool.want).balanceOf(address(this));
-            if (wantBal < _wantAmt) {
-                _wantAmt = wantBal;
-            }
+            _wantAmt = Math.min(wantBal, _wantAmt);
             IERC20(pool.want).safeTransfer(address(msg.sender), _wantAmt);
         }
         user.rewardDebt = user.amount.mul(pool.accumulatedYieldPerShare).div(1e12);
-        emit Withdraw(msg.sender, _wantAmt);
+
+        emit Withdraw(msg.sender, amountRemoved);
     }
 
     // Safe transfer function, just in case if rounding error causes pool to not have enough
-    function safeTransfer(address _to, uint256 yieldAmount) internal {
-        uint256 thisYieldBalance = IERC20(yieldToken).balanceOf(address(this));
-        if (yieldAmount > thisYieldBalance) {
-            IERC20(yieldToken).transfer(_to, thisYieldBalance);
-        } else {
-            IERC20(yieldToken).transfer(_to, yieldAmount);
-        }
+    function safeYieldTransfer(address _to, uint256 toTransfer) private
+    {
+        toTransfer = Math.min(toTransfer, IERC20(yieldToken).balanceOf(address(this)));
+        IERC20(yieldToken).safeTransfer(_to, toTransfer);
+    }
+
+    function setFeeParams(uint256 _newFee, address _newFeeTo) public onlyOwner
+    {
+        require(_newFee <= maxFeeNumerator);
+        feeNumerator = _newFee;
+        feeTo = _newFeeTo;
     }
 
     // Withdraw without caring about rewards. EMERGENCY ONLY.
-    function emergencyWithdraw() public nonReentrant {
+    function emergencyWithdraw() public nonReentrant
+    {
         PoolInfo storage pool = poolInfo;
         UserInfo storage user = userInfo[msg.sender];
 
         uint256 amount = user.amount;
 
-        IStrategy(pool.strat).withdraw(amount);
+        uint256 withdrawn = IStrategy(pool.strat).withdraw(amount);
 
         user.amount = 0;
         user.rewardDebt = 0;
-        IERC20(pool.want).safeTransfer(address(msg.sender), amount);
+        IERC20(pool.want).safeTransfer(address(msg.sender), withdrawn);
         emit EmergencyWithdraw(msg.sender, amount);
     }
 
-    function inCaseTokensGetStuck(address _token, uint256 _amount)
-        public
-        onlyOwner
-    {
-        require(_token != depositToken, "!safe");
-        IERC20(_token).safeTransfer(msg.sender, _amount);
-    }
 }
